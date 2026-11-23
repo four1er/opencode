@@ -27,7 +27,6 @@ import { toolFailure } from "../runtime.js"
 
 export const name = "shell"
 export const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000
-const CODE_MODE_TIMEOUT_MS = 10 * 60 * 1_000
 // How long a call the user interrupted waits for its stopped command to exit before settling with the output so far.
 const INTERRUPT_WAIT = "500 millis"
 
@@ -49,16 +48,15 @@ const description = (shell?: string, codeMode = false) =>
     "Prefer dedicated tools over shell commands when possible.",
     "When output is large, the full result is saved to a file and a truncated preview is returned.",
     "Rely on automatic truncation unless filtering the output is more useful.",
-    "Commands still running after their timeout move to the background.",
-    // Code Mode has no background parameter.
-    ...(codeMode ? [] : ["Background commands return immediately, and you will be notified when they complete."]),
+    // Code Mode has no timeout or background parameter.
+    ...(codeMode
+      ? ["Commands run until they exit; the script's own timeout applies."]
+      : [
+          "Commands still running after their timeout move to the background.",
+          "Background commands return immediately, and you will be notified when they complete.",
+        ]),
     "The current session ID is available in the OPENCODE_SESSION_ID environment variable.",
   ].join(" ")
-
-const timeoutInput = (foreground: number) =>
-  Schema.optionalKey(NonNegativeInt).annotate({
-    description: `Optional timeout in milliseconds (default ${foreground}). When it expires, a foreground command moves to the background and a background command is stopped.`,
-  })
 
 export const Input = Schema.Struct({
   command: Schema.String.annotate({ description: "Shell command string to execute" }),
@@ -66,17 +64,16 @@ export const Input = Schema.Struct({
     description:
       "Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead.",
   }),
-  timeout: timeoutInput(DEFAULT_TIMEOUT_MS),
+  timeout: Schema.optionalKey(NonNegativeInt).annotate({
+    description: `Optional timeout in milliseconds (default ${DEFAULT_TIMEOUT_MS}). When it expires, a foreground command moves to the background and a background command is stopped.`,
+  }),
   background: Schema.optionalKey(Schema.Boolean).annotate({
     description:
       "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion.",
   }),
 })
 
-const CodeModeInput = Schema.Struct({
-  ...Struct.omit(Input.fields, ["background"]),
-  timeout: timeoutInput(CODE_MODE_TIMEOUT_MS),
-})
+const CodeModeInput = Schema.Struct(Struct.omit(Input.fields, ["background", "timeout"]))
 
 const StructuredOutput = Schema.Struct({
   shellID: Schema.optionalKey(Schema.String).annotate({
@@ -427,11 +424,13 @@ export const Plugin = {
           input: Input,
           output: StructuredOutput,
           execute: (input, context) => {
-            // Code Mode input has no background parameter.
+            // Code Mode input has no timeout or background parameter.
             const background = "background" in input && input.background === true
-            // A foreground timeout of 0 falls back to the default, so a call can't block until the command exits.
-            const foreground = input.timeout || (context.codemode ? CODE_MODE_TIMEOUT_MS : DEFAULT_TIMEOUT_MS)
-            const timeout = background ? (input.timeout ?? 0) : foreground
+            const requested = "timeout" in input ? input.timeout : undefined
+            // In Code Mode a command runs until it exits: the script's own timeout moves the script to the background.
+            // A direct call's foreground timeout of 0 falls back to the default, so it can't block until the command exits.
+            const foreground = context.codemode ? 0 : requested || DEFAULT_TIMEOUT_MS
+            const timeout = background ? (requested ?? 0) : foreground
             let finalTimeout = timeout
             // Uninterruptible from spawning to blocking, so an interrupt cannot orphan a started command.
             return Effect.uninterruptibleMask((restore) =>
