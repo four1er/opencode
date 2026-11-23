@@ -1051,7 +1051,7 @@ describe("ShellTool", () => {
     { timeout: 15_000 },
   )
 
-  codeModeIt.live("gives Code Mode shells no timeout or background parameter", () =>
+  codeModeIt.live("gives Code Mode shells a stopping timeout and no background parameter", () =>
     withTempDir((tmp) => {
       reset()
       return withSession(tmp.path, (registry) =>
@@ -1064,9 +1064,9 @@ describe("ShellTool", () => {
           )
           expect(pinned.map((entry) => entry.path)).toEqual(["shell"])
           expect(pinned[0]!.line).toContain("Execute a shell command and return its output.")
-          expect(pinned[0]!.line).toContain("Commands run until they exit; the script's own timeout applies.")
-          // No timeout or background parameter in Code Mode.
-          expect(pinned[0]!.line).not.toContain("timeout?:")
+          expect(pinned[0]!.line).toContain("Commands run until they exit or their timeout stops them.")
+          expect(pinned[0]!.line).toContain("Optional limit in milliseconds; the command is stopped when it expires.")
+          // No background parameter in Code Mode.
           expect(pinned[0]!.line).not.toContain("background?: boolean")
           expect(pinned[0]!.line).not.toContain("after their timeout move to the background")
           expect(pinned[0]!.line).not.toContain("Background commands return immediately")
@@ -1087,6 +1087,7 @@ describe("ShellTool", () => {
           expect(direct?.inputSchema).toHaveProperty("properties.background")
           expect(direct?.description).toContain("Commands still running after their timeout move to the background.")
           expect(direct?.description).not.toContain("Commands run until they exit")
+          expect(JSON.stringify(direct?.inputSchema)).toContain("a foreground command moves to the background")
         }),
       )
     }),
@@ -1128,6 +1129,34 @@ describe("ShellTool", () => {
             metadata: { source: "codemode", jobID, state: "completed" },
           })
           expect(timeouts).toEqual([0, 0])
+        }),
+      )
+    }),
+  )
+
+  codeModeIt.live("stops a Code Mode shell when its timeout expires, reporting the output so far", () =>
+    withTempDir((tmp) => {
+      reset()
+      return withSession(tmp.path, (registry) =>
+        Effect.gen(function* () {
+          const command = progressOverflowCommand(6, "release")
+          const result = yield* runScript(registry, "call-shell-timeout", {
+            code: `return await tools.shell(${JSON.stringify({ command, timeout: 300 })})`,
+            timeout: 10_000,
+          }).pipe(Effect.timeout("8 seconds"))
+          expect(result.status).toBe("completed")
+          const stopped = JSON.parse(result.output.output)
+          expect(stopped).toEqual({
+            output: "xxxxxx",
+            exitCode: null,
+            ...(stopped.signal === undefined ? {} : { signal: expect.any(String) }),
+            killed: "Stopped when its timeout of 0.3 seconds expired.",
+            outputPath: expect.any(String),
+            wallTimeSeconds: expect.any(Number),
+          })
+          expect(stopped.shellID).toBeUndefined()
+          expect(yield* Effect.promise(() => Bun.file(stopped.outputPath).text())).toBe("xxxxxx")
+          expect(yield* Shell.Service.use((shell) => shell.list())).toEqual([])
         }),
       )
     }),

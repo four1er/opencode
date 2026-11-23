@@ -48,9 +48,9 @@ const description = (shell?: string, codeMode = false) =>
     "Prefer dedicated tools over shell commands when possible.",
     "When output is large, the full result is saved to a file and a truncated preview is returned.",
     "Rely on automatic truncation unless filtering the output is more useful.",
-    // Code Mode has no timeout or background parameter.
+    // Code Mode has no background parameter.
     ...(codeMode
-      ? ["Commands run until they exit; the script's own timeout applies."]
+      ? ["Commands run until they exit or their timeout stops them."]
       : [
           "Commands still running after their timeout move to the background.",
           "Background commands return immediately, and you will be notified when they complete.",
@@ -73,7 +73,12 @@ export const Input = Schema.Struct({
   }),
 })
 
-const CodeModeInput = Schema.Struct(Struct.omit(Input.fields, ["background", "timeout"]))
+const CodeModeInput = Schema.Struct({
+  ...Struct.omit(Input.fields, ["background"]),
+  timeout: Schema.optionalKey(NonNegativeInt).annotate({
+    description: "Optional limit in milliseconds; the command is stopped when it expires.",
+  }),
+})
 
 const StructuredOutput = Schema.Struct({
   shellID: Schema.optionalKey(Schema.String).annotate({
@@ -87,10 +92,11 @@ const StructuredOutput = Schema.Struct({
   signal: Schema.optionalKey(Schema.String).annotate({ description: "The signal that ended the command, if any" }),
   killed: Schema.optionalKey(Schema.String).annotate({
     description:
-      "Why the command ended without an exit code, when the reason is known: the machine's worker restarted or lost the process, or the local process daemon stopped",
+      "Why the command ended without an exit code, when the reason is known: its timeout expired, the machine's worker restarted or lost the process, or the local process daemon stopped",
   }),
   outputPath: Schema.optionalKey(Schema.String).annotate({
-    description: "File with the full output, when output was truncated or the command is running in the background",
+    description:
+      "File with the full output, when output was truncated, its timeout stopped the command, or it is running in the background",
   }),
   pid: Schema.optionalKey(NonNegativeInt).annotate({
     description: "Process ID while the command is running in the background",
@@ -120,6 +126,9 @@ const toolResult = (output: Output, timeout?: number) => {
     output: {
       ...Struct.omit(output, ["exit", "status", "truncated", "timeout"]),
       exitCode: output.exit ?? null,
+      ...(output.timeout && output.killed === undefined
+        ? { killed: `Stopped when its timeout${timeout ? ` of ${timeout / 1_000} seconds` : ""} expired.` }
+        : {}),
     },
     content: resultMessages(output, timeout).map((text) => ({
       type: "text" as const,
@@ -230,7 +239,7 @@ const startJob = Effect.fnUntraced(function* (
         ...ShellResult.output(result),
         status: "completed" as const,
         wallTimeSeconds: wallTimeSeconds(result.info.time, completed),
-        ...(result.capture.truncated ? { outputPath: result.info.file } : {}),
+        ...(result.capture.truncated || result.info.status === "timeout" ? { outputPath: result.info.file } : {}),
       }
     }).pipe(
       Effect.tap((output) => Deferred.succeed(settled, output)),
@@ -424,13 +433,13 @@ export const Plugin = {
           input: Input,
           output: StructuredOutput,
           execute: (input, context) => {
-            // Code Mode input has no timeout or background parameter.
+            // Code Mode input has no background parameter.
             const background = "background" in input && input.background === true
-            const requested = "timeout" in input ? input.timeout : undefined
-            // In Code Mode a command runs until it exits: the script's own timeout moves the script to the background.
+            // A background or Code Mode command's timeout stops it; in Code Mode none moves the command to the
+            // background, as the script's own timeout moves the whole script there instead.
+            const stops = background || context.codemode === true
             // A direct call's foreground timeout of 0 falls back to the default, so it can't block until the command exits.
-            const foreground = context.codemode ? 0 : requested || DEFAULT_TIMEOUT_MS
-            const timeout = background ? (requested ?? 0) : foreground
+            const timeout = stops ? (input.timeout ?? 0) : input.timeout || DEFAULT_TIMEOUT_MS
             let finalTimeout = timeout
             // Uninterruptible from spawning to blocking, so an interrupt cannot orphan a started command.
             return Effect.uninterruptibleMask((restore) =>
@@ -484,8 +493,8 @@ export const Plugin = {
                         finalTimeout = yield* restore(
                           Effect.raceFirst(prepare(invocation, context, { cwd, target }), stoppedBeforeStart),
                         )
-                        // A foreground timeout moves the command to the background instead of stopping it.
-                        if (!background) invocation.timeout = 0
+                        // A direct foreground timeout moves the command to the background instead of stopping it.
+                        if (!stops) invocation.timeout = 0
                       }),
                   )
                   yield* context.progress({ shellID: info.id })
@@ -506,7 +515,7 @@ export const Plugin = {
 
                   const waiting = jobs.block({ id: job.id, sessionID: context.sessionID })
                   const blocked =
-                    finalTimeout > 0
+                    !stops && finalTimeout > 0
                       ? waiting.pipe(
                           Effect.timeoutOption(finalTimeout),
                           Effect.flatMap((result) =>
