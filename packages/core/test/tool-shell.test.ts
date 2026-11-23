@@ -1119,7 +1119,6 @@ describe("ShellTool", () => {
           expect(result.status).toBe("completed")
           const jobID = String(result.metadata?.jobID)
           expect(result.output.output).toBe(`Script ${jobID} is still running; its result will arrive in this session.`)
-          expect(timeouts).toEqual([0, 0])
           yield* runningShell(progressOverflowCommand(6, "release"))
           yield* Effect.promise(() => Bun.write(path.join(tmp.path, "release"), ""))
           // The shell finished inside the script, so the script's result holds its final output.
@@ -1128,6 +1127,7 @@ describe("ShellTool", () => {
             text: expect.stringMatching(/\{"exitCode":0,"wallTimeSeconds":[\d.]+,"output":"xxxxxx"\}\]/),
             metadata: { source: "codemode", jobID, state: "completed" },
           })
+          expect(timeouts).toEqual([0, 0])
         }),
       )
     }),
