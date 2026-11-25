@@ -24,6 +24,7 @@ import { SessionMessage } from "@opencode/core/session/message"
 import { SessionRunner } from "@opencode/core/session/runner/index"
 import { SessionInboxTable, SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
+import { SubagentJob } from "@opencode/core/session/subagent-job"
 import { Shell } from "@opencode/core/shell"
 import { BlobStore } from "@opencode/core/blob-store"
 import { Environment } from "@opencode/core/environment/index"
@@ -366,6 +367,205 @@ describe("SessionExecution lifecycle", () => {
       ])
       expect((yield* claims(database))[child]).toBe(false)
       expect(yield* attempts(database, child)).toBe(0)
+    }),
+  )
+
+  for (const parentActive of [true, false]) {
+    it.effect(
+      `cancels running subagents when an ${parentActive ? "active" : "idle"} parent is interrupted and does not resume them on restart`,
+      () =>
+        Effect.gen(function* () {
+          const database = yield* Database.Service
+          const parent = Session.ID.make(`ses_interrupt_parent_${parentActive}`)
+          const child = Session.ID.make(`ses_interrupt_child_${parentActive}`)
+          const grandchild = Session.ID.make(`ses_interrupt_grandchild_${parentActive}`)
+          const unrelatedParent = Session.ID.make(`ses_interrupt_other_parent_${parentActive}`)
+          const unrelated = Session.ID.make(`ses_interrupt_other_child_${parentActive}`)
+          yield* seedSessions(database, [parent, unrelatedParent])
+          yield* seedSessions(database, [child], { parent_id: parent })
+          yield* seedSessions(database, [grandchild], { parent_id: child })
+          yield* seedSessions(database, [unrelated], { parent_id: unrelatedParent })
+
+          const started = {
+            parent: yield* Deferred.make<void>(),
+            child: yield* Deferred.make<void>(),
+            grandchild: yield* Deferred.make<void>(),
+            unrelated: yield* Deferred.make<void>(),
+          }
+          const scope = yield* Scope.make()
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+          const jobs = yield* Job.make.pipe(Scope.provide(scope))
+          const context = yield* buildExecution(
+            scope,
+            ({ sessionID }) => {
+              const latch =
+                sessionID === parent
+                  ? started.parent
+                  : sessionID === child
+                    ? started.child
+                    : sessionID === grandchild
+                      ? started.grandchild
+                      : sessionID === unrelated
+                        ? started.unrelated
+                        : undefined
+              return (latch ? Deferred.succeed(latch, undefined) : Effect.void).pipe(Effect.andThen(Effect.never))
+            },
+            undefined,
+            jobs,
+          )
+          const execution = Context.get(context, SessionExecution.Service)
+
+          // A background shell owned by the parent stays alive across a user interrupt.
+          yield* seedBackground(jobs, parent, [
+            { id: "sh_parent_kept", shellID: "sh_parent_kept", command: "sleep 60" },
+          ])
+          if (parentActive) yield* execution.resume(parent).pipe(Effect.forkIn(scope))
+          yield* SubagentJob.start(jobs, execution, {
+            kind: "subagent",
+            parentSessionID: parent,
+            childSessionID: child,
+            agent: "explore",
+            description: "Child task",
+          })
+          yield* SubagentJob.start(jobs, execution, {
+            kind: "subagent",
+            parentSessionID: child,
+            childSessionID: grandchild,
+            agent: "explore",
+            description: "Grandchild task",
+          })
+          yield* SubagentJob.start(jobs, execution, {
+            kind: "subagent",
+            parentSessionID: unrelatedParent,
+            childSessionID: unrelated,
+            agent: "explore",
+            description: "Unrelated task",
+          })
+
+          if (parentActive) yield* Deferred.await(started.parent)
+          yield* Deferred.await(started.child)
+          yield* Deferred.await(started.grandchild)
+          yield* Deferred.await(started.unrelated)
+
+          expect(yield* execution.interrupt(parent)).toBeTrue()
+          yield* execution.awaitIdle(parent)
+          expect((yield* jobs.pendingBackground).map((item) => item.id).toSorted()).toEqual(
+            ["sh_parent_kept", unrelated].toSorted(),
+          )
+          yield* Effect.forEach([child, grandchild], execution.awaitIdle, { discard: true })
+
+          expect(yield* execution.isActive(parent)).toBe(false)
+          expect(yield* execution.isActive(child)).toBe(false)
+          expect(yield* execution.isActive(grandchild)).toBe(false)
+          expect(yield* execution.isActive(unrelated)).toBe(true)
+          expect(yield* claims(database)).toEqual({
+            [parent]: false,
+            [child]: false,
+            [grandchild]: false,
+            [unrelatedParent]: false,
+            [unrelated]: true,
+          })
+          expect(yield* SessionInbox.list(database.db, parent)).toEqual([])
+          expect(yield* SessionInbox.list(database.db, child)).toEqual([])
+
+          // Simulate a server restart: only the unrelated subagent may resume.
+          yield* Scope.close(scope, Exit.void)
+          const restartedScope = yield* Scope.make()
+          yield* Effect.addFinalizer(() => Scope.close(restartedScope, Exit.void))
+          const restartedJobs = yield* Job.make.pipe(Scope.provide(restartedScope))
+          const resumed = yield* Deferred.make<void>()
+          const unrelatedParentWoken = yield* Deferred.make<void>()
+          const drained: Session.ID[] = []
+          const restarted = yield* buildExecution(
+            restartedScope,
+            ({ sessionID }) =>
+              Effect.sync(() => void drained.push(sessionID)).pipe(
+                Effect.andThen(
+                  sessionID === unrelated
+                    ? Deferred.succeed(resumed, undefined)
+                    : sessionID === unrelatedParent
+                      ? Deferred.succeed(unrelatedParentWoken, undefined)
+                      : Effect.void,
+                ),
+              ),
+            undefined,
+            restartedJobs,
+          )
+          yield* Context.get(restarted, SessionRestart.Service).resumeSuspendedSessions
+          yield* Deferred.await(resumed)
+          yield* Deferred.await(unrelatedParentWoken)
+          yield* Effect.forEach(
+            [unrelated, unrelatedParent, parent, child, grandchild],
+            Context.get(restarted, SessionExecution.Service).awaitIdle,
+            { discard: true },
+          )
+          expect(drained).toEqual([unrelated, unrelatedParent])
+        }),
+    )
+  }
+
+  it.effect("preserves running subagents across shutdown teardown so restart resumes them", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const parent = Session.ID.make("ses_shutdown_keep_parent")
+      const child = Session.ID.make("ses_shutdown_keep_child")
+      yield* seedSessions(database, [parent])
+      yield* seedSessions(database, [child], { parent_id: parent })
+
+      const parentStarted = yield* Deferred.make<void>()
+      const childStarted = yield* Deferred.make<void>()
+      const scope = yield* Scope.make()
+      const jobs = yield* Job.make.pipe(Scope.provide(scope))
+      const context = yield* buildExecution(
+        scope,
+        ({ sessionID }) =>
+          Deferred.succeed(sessionID === parent ? parentStarted : childStarted, undefined).pipe(
+            Effect.andThen(Effect.never),
+          ),
+        undefined,
+        jobs,
+      )
+      const execution = Context.get(context, SessionExecution.Service)
+      yield* execution.resume(parent).pipe(Effect.forkIn(scope))
+      yield* SubagentJob.start(jobs, execution, {
+        kind: "subagent",
+        parentSessionID: parent,
+        childSessionID: child,
+        agent: "explore",
+        description: "Survives shutdown",
+      })
+      yield* Deferred.await(parentStarted)
+      yield* Deferred.await(childStarted)
+
+      // Shutdown teardown must leave both claims and the running subagent job intact.
+      yield* Scope.close(scope, Exit.void)
+      expect(yield* claims(database)).toEqual({ [parent]: true, [child]: true })
+
+      const restartedScope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(restartedScope, Exit.void))
+      const restartedJobs = yield* Job.make.pipe(Scope.provide(restartedScope))
+      expect(yield* restartedJobs.pendingBackground).toMatchObject([{ id: child, status: "running" }])
+
+      const drained: Session.ID[] = []
+      const childResumed = yield* Deferred.make<void>()
+      const parentResumed = yield* Deferred.make<void>()
+      const restarted = yield* buildExecution(
+        restartedScope,
+        ({ sessionID }) =>
+          Effect.sync(() => void drained.push(sessionID)).pipe(
+            Effect.andThen(Deferred.succeed(sessionID === child ? childResumed : parentResumed, undefined)),
+          ),
+        undefined,
+        restartedJobs,
+      )
+      yield* Context.get(restarted, SessionRestart.Service).resumeSuspendedSessions
+      yield* Deferred.await(parentResumed)
+      yield* Deferred.await(childResumed)
+      yield* Effect.forEach([parent, child], Context.get(restarted, SessionExecution.Service).awaitIdle, {
+        discard: true,
+      })
+      expect(drained).toContain(parent)
+      expect(drained).toContain(child)
     }),
   )
 

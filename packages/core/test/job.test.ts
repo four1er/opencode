@@ -549,6 +549,82 @@ describe("Job", () => {
     }),
   )
 
+  it.live(
+    "cancels only running child subagent jobs on cancelSubagents while keeping shells and completed reports",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* Job.Service
+        const parent = SessionSchema.ID.make("ses_cancel_subagents_parent")
+        const runningChild = SessionSchema.ID.make("ses_cancel_subagents_running")
+        const completedChild = SessionSchema.ID.make("ses_cancel_subagents_completed")
+        const otherParent = SessionSchema.ID.make("ses_cancel_subagents_other_parent")
+        const otherChild = SessionSchema.ID.make("ses_cancel_subagents_other_child")
+        const interrupted = yield* Deferred.make<void>()
+
+        const shell = yield* jobs.start({
+          id: "sh_cancel_subagents_kept",
+          type: "shell",
+          recovery: { kind: "shell", sessionID: parent, shellID: "sh_cancel_subagents_kept", command: "sleep 60" },
+          background: true,
+          run: Effect.never,
+        })
+        const running = yield* jobs.start({
+          id: runningChild,
+          type: "subagent",
+          recovery: {
+            kind: "subagent",
+            parentSessionID: parent,
+            childSessionID: runningChild,
+            agent: "explore",
+            description: "Running child",
+          },
+          background: true,
+          run: Effect.never.pipe(Effect.ensuring(Deferred.succeed(interrupted, undefined))),
+        })
+        const completed = yield* jobs.start({
+          id: completedChild,
+          type: "subagent",
+          recovery: {
+            kind: "subagent",
+            parentSessionID: parent,
+            childSessionID: completedChild,
+            agent: "explore",
+            description: "Completed child",
+          },
+          background: true,
+          run: Effect.succeed("finished"),
+        })
+        const other = yield* jobs.start({
+          id: otherChild,
+          type: "subagent",
+          recovery: {
+            kind: "subagent",
+            parentSessionID: otherParent,
+            childSessionID: otherChild,
+            agent: "explore",
+            description: "Other child",
+          },
+          background: true,
+          run: Effect.never,
+        })
+        yield* jobs.wait({ id: completed.id })
+
+        const cancelled = yield* jobs.cancelSubagents(parent)
+        expect(cancelled).toMatchObject([{ id: running.id, status: "cancelled" }])
+        yield* Deferred.await(interrupted).pipe(Effect.timeout("1 second"))
+        expect(yield* jobs.get(running.id)).toBeUndefined()
+        expect((yield* jobs.get(shell.id))?.status).toBe("running")
+        expect((yield* jobs.get(other.id))?.status).toBe("running")
+        expect((yield* jobs.pendingBackground).map((item) => item.id).toSorted()).toEqual(
+          [completed.id, other.id, shell.id].toSorted(),
+        )
+
+        for (const item of yield* jobs.pendingBackground) yield* jobs.completeBackground(item.notificationID)
+        yield* jobs.cancelSession(parent)
+        yield* jobs.cancelSession(otherParent)
+      }),
+  )
+
   it.live("does not restore a consumed background row when its running work settles", () =>
     Effect.gen(function* () {
       const jobs = yield* Job.Service
@@ -802,6 +878,31 @@ describe("Job", () => {
       yield* jobs.cancel(explicit.id)
       expect(yield* jobs.isCancelled(explicit.id)).toBe(true)
       yield* Deferred.await(cancelled).pipe(Effect.timeout("1 second"))
+
+      const sessionID = SessionSchema.ID.make("ses_cancel_session_flag")
+      const observedCancel = yield* Deferred.make<boolean>()
+      yield* jobs.start({
+        id: "job_session_cancel_flag",
+        type: "subagent",
+        recovery: {
+          kind: "subagent",
+          parentSessionID: sessionID,
+          childSessionID: SessionSchema.ID.make("ses_cancel_session_child"),
+          agent: "explore",
+          description: "Session cancel flag",
+        },
+        background: true,
+        run: Effect.never.pipe(
+          Effect.onInterrupt(() =>
+            jobs.isCancelled("job_session_cancel_flag").pipe(
+              Effect.flatMap((value) => Deferred.succeed(observedCancel, value)),
+              Effect.asVoid,
+            ),
+          ),
+        ),
+      })
+      yield* jobs.cancelSession(sessionID)
+      expect(yield* Deferred.await(observedCancel).pipe(Effect.timeout("1 second"))).toBe(true)
 
       const scope = yield* Scope.make()
       const abandoned = yield* Job.make.pipe(Scope.provide(scope))

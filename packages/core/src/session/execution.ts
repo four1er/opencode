@@ -1,6 +1,6 @@
 export * as SessionExecution from "./execution.js"
 
-import { Cause, Context, Effect, Exit, Layer } from "effect"
+import { Cause, Context, Effect, Exit, Layer, Schema } from "effect"
 import { Bus } from "../bus.js"
 import { CodeModeJob } from "../codemode/job.js"
 import { Database } from "../database/database.js"
@@ -45,11 +45,15 @@ export interface Interface {
 /** Routes execution from a Session ID to its selected instance's runner. */
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionExecution") {}
 
-type InterruptReason = "user" | "shutdown"
+type InterruptReason = "user" | "parent" | "shutdown"
 
 export function terminal(exit: Exit.Exit<void, SessionRunner.RunError>, reason?: InterruptReason) {
   if (Exit.isSuccess(exit)) return { type: "succeeded" as const }
-  if (Cause.hasInterrupts(exit.cause)) return { type: "interrupted" as const, reason: reason ?? "shutdown" }
+  if (Cause.hasInterrupts(exit.cause))
+    return {
+      type: "interrupted" as const,
+      reason: reason === "parent" ? ("user" as const) : (reason ?? "shutdown"),
+    }
   return { type: "failed" as const, error: toSessionError(Cause.squash(exit.cause)) }
 }
 
@@ -118,7 +122,10 @@ export const layer = Layer.effect(
           continuation,
           promotable,
           stepped,
-          interruption: () => interruption(sessionID),
+          interruption: () => {
+            const reason = interruption(sessionID)
+            return reason === "parent" ? "user" : reason
+          },
         }),
       ).pipe(
         Effect.provideServiceEffect(CodeModeJob.Current, background),
@@ -135,6 +142,55 @@ export const layer = Layer.effect(
         Reloaded: (result) => drain(sessionID, result.force, result.continuation, promotable, result.stepped),
       })
     })
+    const cancelChildSubagents = (
+      parentSessionID: SessionSchema.ID,
+      visited = new Set<SessionSchema.ID>(),
+    ): Effect.Effect<boolean> =>
+      Effect.gen(function* () {
+        if (visited.has(parentSessionID)) return false
+        visited.add(parentSessionID)
+        const childIDs = new Set<SessionSchema.ID>()
+        for (const recovery of yield* jobs.runningBackground) {
+          if (recovery.kind === "subagent" && recovery.parentSessionID === parentSessionID) {
+            childIDs.add(recovery.childSessionID)
+          }
+        }
+        for (const background of yield* jobs.pendingBackground) {
+          if (
+            background.status === "running" &&
+            background.recovery.kind === "subagent" &&
+            background.recovery.parentSessionID === parentSessionID
+          ) {
+            childIDs.add(background.recovery.childSessionID)
+          }
+        }
+        const active = holder.coordinator ? yield* holder.coordinator.active : new Set<SessionSchema.ID>()
+        for (const activeID of active) {
+          if (activeID === parentSessionID || childIDs.has(activeID)) continue
+          if ((yield* store.get(activeID))?.parentID === parentSessionID) childIDs.add(activeID)
+        }
+
+        let stopped = false
+        // Interrupt children with reason "parent" before cancelling their jobs so SubagentJob's
+        // onInterrupt sees them already stopping and their settlement does not wake the parent.
+        for (const childID of childIDs) {
+          if (holder.coordinator && (yield* holder.coordinator.interrupt(childID, "parent"))) stopped = true
+        }
+        const cancelled = yield* jobs.cancelSubagents(parentSessionID)
+        if (cancelled.length > 0) stopped = true
+        for (const info of cancelled) {
+          if (Schema.is(SessionSchema.ID)(info.id) && !childIDs.has(info.id)) {
+            childIDs.add(info.id)
+            if (holder.coordinator && (yield* holder.coordinator.interrupt(info.id, "parent"))) stopped = true
+          }
+        }
+        for (const childID of childIDs) {
+          if (!holder.coordinator || !(yield* holder.coordinator.isActive(childID))) yield* store.release(childID)
+          if (yield* cancelChildSubagents(childID, visited)) stopped = true
+        }
+        return stopped
+      })
+
     const coordinator = yield* SessionRunCoordinator.make<SessionSchema.ID, SessionRunner.RunError, InterruptReason>({
       started: (sessionID) =>
         reportLifecycle(
@@ -164,9 +220,19 @@ export const layer = Layer.effect(
               yield* bus.publish(SessionEvent.Execution.Interrupted, { sessionID, reason: "shutdown" })
               return
             }
+            if (outcome.type === "interrupted" && reason === "parent") {
+              subagentReport.clear(sessionID)
+              // Parent-initiated cancellation stops the child without reporting back or waking the parent.
+              yield* cancelChildSubagents(sessionID)
+              yield* publishTerminal(bus, sessionID, outcome, () => store.release(sessionID))
+              return
+            }
             // Claim the Job generation before cancelling it so the settlement commit owns its outbox row.
             const settlement = yield* subagentReport.prepare(sessionID, outcome)
-            if (outcome.type === "interrupted") yield* jobs.cancel(sessionID)
+            if (outcome.type === "interrupted") {
+              yield* jobs.cancel(sessionID)
+              yield* cancelChildSubagents(sessionID)
+            }
             yield* publishTerminal(bus, sessionID, outcome, settlement.commit)
             // Post-commit delivery is best effort: a retained outbox marker is recovered on the
             // next restart, and a delivery defect must not fail the settled hook.
@@ -184,7 +250,9 @@ export const layer = Layer.effect(
       isActive: coordinator.isActive,
       interrupt: (sessionID, options) =>
         Effect.gen(function* () {
-          const interrupted = yield* coordinator.interrupt(sessionID, "user")
+          const own = yield* coordinator.interrupt(sessionID, "user")
+          const children = yield* cancelChildSubagents(sessionID)
+          const interrupted = own || children
           if (!options?.resume) return interrupted
           // Resume steering input and between-turn control work from the interrupted
           // intent. Queued next-turn prompts stay parked: a steer-scoped drain never

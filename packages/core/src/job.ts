@@ -1,6 +1,6 @@
 export * as Job from "./job.js"
 
-import { asc, eq, or } from "drizzle-orm"
+import { and, asc, eq, or } from "drizzle-orm"
 import {
   Array,
   Cause,
@@ -174,6 +174,7 @@ export interface Interface {
   readonly backgroundAll: (input: BackgroundAllInput) => Effect.Effect<Info[]>
   readonly cancel: (id: string) => Effect.Effect<Info | undefined>
   readonly cancelSession: (sessionID: SessionSchema.ID) => Effect.Effect<Info[]>
+  readonly cancelSubagents: (parentSessionID: SessionSchema.ID) => Effect.Effect<Info[]>
   readonly pendingBackground: Effect.Effect<readonly Background[]>
   readonly runningBackground: Effect.Effect<readonly Recovery[]>
   readonly backgroundJobs: Effect.Effect<readonly JobList.Item[]>
@@ -216,6 +217,11 @@ function matchesSession(job: Active, sessionID: SessionSchema.ID) {
   if (job.recovery.kind === "subagent")
     return job.recovery.parentSessionID === sessionID || job.recovery.childSessionID === sessionID
   return job.recovery.sessionID === sessionID
+}
+
+function isChildSubagent(job: Active, parentSessionID: SessionSchema.ID) {
+  if (job.recovery?.kind === "subagent") return job.recovery.parentSessionID === parentSessionID
+  return job.info.type === "subagent" && job.info.metadata?.sessionID === parentSessionID
 }
 
 function errorText(cause: Cause.Cause<unknown>) {
@@ -561,7 +567,7 @@ export const make = Effect.gen(function* () {
         const next = {
           ...job,
           blockingSessions: new Map<SessionSchema.ID, number>(),
-          cancelledByCaller: persist,
+          cancelledByCaller: true,
           info: {
             ...job.info,
             status: "cancelled" as const,
@@ -607,6 +613,29 @@ export const make = Effect.gen(function* () {
       const next = new Map(jobs)
       for (const [id, job] of jobs) {
         if (matchesSession(job, sessionID)) next.delete(id)
+      }
+      return next
+    })
+    return cancelled.filter((info): info is Info => info !== undefined)
+  })
+
+  const cancelSubagents: Interface["cancelSubagents"] = Effect.fn("Job.cancelSubagents")(function* (parentSessionID) {
+    const ids = [...(yield* SynchronizedRef.get(state.jobs)).values()]
+      .filter((job) => job.info.status === "running" && isChildSubagent(job, parentSessionID))
+      .map((job) => job.info.id)
+    const cancelled = yield* Effect.forEach(ids, (id) => cancelInternal(id, false))
+    yield* db
+      .delete(JobTable)
+      .where(
+        and(eq(JobTable.session_id, parentSessionID), eq(JobTable.kind, "subagent"), eq(JobTable.status, "running")),
+      )
+      .run()
+      .pipe(Effect.orDie)
+    yield* SynchronizedRef.update(state.jobs, (jobs) => {
+      const next = new Map(jobs)
+      for (const [id, job] of jobs) {
+        if ((job.info.status === "running" || job.info.status === "cancelled") && isChildSubagent(job, parentSessionID))
+          next.delete(id)
       }
       return next
     })
@@ -749,6 +778,7 @@ export const make = Effect.gen(function* () {
     backgroundAll,
     cancel,
     cancelSession,
+    cancelSubagents,
     pendingBackground,
     runningBackground,
     backgroundJobs: JobList.read(db, state.jobs),
